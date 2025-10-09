@@ -122,3 +122,37 @@ resource "aws_lambda_permission" "apigw" {
     principal = "apigateway.amazonaws.com"
     source_arn = "${aws_apigatewayv2_api.onboarding_api.execution_arn}"
 }
+
+################################
+##      IAM role for EC2      ##
+################################
+resource "aws_iam_role" "op_sqs_role" {
+    name = "op-sqs-role"
+    assume_role_policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [{
+            Effect = "Allow"
+            Principal = {
+                Service = "ec2.amazonaws.com"
+                Action = "sts:AssumeRole"
+            }
+        }]
+    })
+}
+
+resource "aws_iam_role_policy" "op_sqs_policy" {
+    name = "op-sqs-policy"
+    role = aws_iam_role.op_sqs_role.id
+    policy = jsonencode({
+        Version = "2012-10-17"
+        Statement = [{
+            Effect = "Allow"
+            Action = [
+                "sqs:ReceiveMessage",
+                "sqs:DeleteMessage",
+                "sqs:GetQueueAttributes"
+            ]
+            Resource = aws_sqs_queue.newhire_queue.arn
+        }]
+    })
+}
