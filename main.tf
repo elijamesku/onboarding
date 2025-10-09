@@ -73,8 +73,6 @@ resource "aws_iam_policy" "s3_write_policy"{
     })
 }
 
-
-
 ################################
 ##      Lambda Function       ##
 ################################
@@ -94,4 +92,19 @@ resource "aws_lambda_function" "onboarding" {
         LOG_BUCKET = aws_s3_bucket.onboarding_logs.id
       }
     }
+}
+
+################################
+##     API Gateway (HTTP)     ##
+################################
+resource "aws_apigatewayv2_api" "onboarding_api" {
+    name = "onboarding-api"
+    protocol_type = "HTTP"
+}
+
+resource "aws_apigatewayv2_integration" "lambda_integration" {
+    api_id = aws_apigatewayv2_api.onboarding_api.id
+    integration_type = "AWS_PROXY"
+    integration_uri = aws_lambda_function.onboarding.arn
+    payload_format_version = "2.0"
 }
