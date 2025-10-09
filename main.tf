@@ -2,9 +2,9 @@ provider "aws" {
     region = var.aws_region
 }
 
-###########################
-## SQS Queue
-###########################
+################################
+##         SQS Queue          ##
+################################
 resource "aws_sqs_queue" "newhire_queue" {
     name = "newhire-queue"
     visibility_timeout_seconds = 30
@@ -12,9 +12,9 @@ resource "aws_sqs_queue" "newhire_queue" {
   
 }
   
-###########################
-## S3 Bucket for logs
-###########################
+################################
+##     S3 Bucket for logs     ##
+################################
 resource "aws_s3_bucket" "onboarding_logs" {
     bucket = "onboarding-logs-${var.aws_account_id}"
     force_destroy = false
@@ -24,9 +24,9 @@ resource "aws_s3_bucket" "onboarding_logs" {
     }
 }
 
-###########################
-## IAM Role for Lambda
-###########################
+################################
+##    Iam role for lambda     ##
+################################
 resource "aws_iam_role" "lambda_exec" {
     name = "onboarding-lambda-role"
     assume_role_policy = jsonencode({
@@ -58,9 +58,9 @@ resource "aws_iam_role_policy_attachment" "lambda_s3_write" {
 }
 
 
-###########################
-## IAM Policy for S3 Write
-###########################
+################################
+##  IAM Policy for S3 Write   ##
+################################
 resource "aws_iam_policy" "s3_write_policy"{
     name = "onboarding-s3-write"
     policy = jsonencode({
@@ -71,4 +71,27 @@ resource "aws_iam_policy" "s3_write_policy"{
             Resource = "${aws_s3_bucket.onboarding_logs.arn}"
         }]
     })
+}
+
+
+
+################################
+##      Lambda Function       ##
+################################
+resource "aws_lambda_function" "onboarding" {
+    filename = "lambda.zip"
+    function_name = "onboarding-lambda"
+    role = aws_iam_role.lambda_exec.arn
+    handler = "index.handler"
+    runtime = "nodejs18.x"
+    timeout = 10
+
+    environment {
+      variables = {
+        API_KEY = var.lambda_api_key
+        SQS_QUEUE_URL = aws_sqs_queue.newhire_queue.id
+        AWS_REGION = var.aws_region
+        LOG_BUCKET = aws_s3_bucket.onboarding_logs.id
+      }
+    }
 }
