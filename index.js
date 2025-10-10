@@ -15,28 +15,32 @@ exports.handler = async (event) => {
 
     try {
         const body = JSON.parse(event.body || '{}');
-        if(API_KEY && event.headers['x-api-key'] !== API_KEY) {
+
+        
+        const headers = {};
+        if (event.headers) {
+          Object.keys(event.headers).forEach(k => headers[k.toLowerCase()] = event.headers[k]);
+        }
+        if (API_KEY && headers['x-api-key'] !== API_KEY) {
             return {
                 statusCode: 401,
-                body: JSON.stringify({
-                    message: "Unauthorized"
-                })
+                body: JSON.stringify({ message: "Unauthorized" })
             };
         }
+
         if (!body.requestId){
             return {
                 statusCode: 400,
-                body: JSON.stringify({
-                    message: "Missing requestId"
-                })
+                body: JSON.stringify({ message: "Missing requestId" })
             };
         }
+
         await sqs.sendMessage({
             QueueUrl: QUEUE_URL,
             MessageBody: JSON.stringify(body)
         }).promise();
 
-        if(LOG_BUCKET) {
+        if (LOG_BUCKET) {
             await s3.putObject({
                 Bucket: LOG_BUCKET,
                 Key: `jobs/${body.requestId}.json`,
@@ -44,22 +48,17 @@ exports.handler = async (event) => {
                 ContentType: "application/json"
             }).promise();
         }
+
         return {
             statusCode: 202,
-            body: JSON.stringify({
-                message: "queued",
-                jobId: body.requestId
-            })
+            body: JSON.stringify({ message: "queued", jobId: body.requestId })
         };
     }
     catch (error) {
         console.error("Error:", error);
         return {
             statusCode: 500,
-            body: JSON.stringify({
-                message: "Internal server error",
-                error: error.message
-            })
+            body: JSON.stringify({ message: "Internal server error", error: error.message })
         };
     }
 };
