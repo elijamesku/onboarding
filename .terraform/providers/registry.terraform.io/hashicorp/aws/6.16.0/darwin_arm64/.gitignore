@@ -1,0 +1,18 @@
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+terraform.rc
+
+# Build artifacts
+lambda.zip
+
+# Python
+.venv/
+__pycache__/
+*.pyc
