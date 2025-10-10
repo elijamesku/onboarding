@@ -4,10 +4,10 @@ provider "aws" {
 
 terraform {
   backend "s3" {
-    bucket         = "tf-state-bucket"
-    key            = "onboarding/terraform.tfstate"
+    bucket         = "tf-state-lead-prod"
+    key            = "onboarding/prod/terraform.tfstate"
     region         = "us-east-1"
-    dynamodb_table = "terraform-locks"
+    dynamodb_table = "tf-state-locks"
     encrypt        = true
   }
 }
