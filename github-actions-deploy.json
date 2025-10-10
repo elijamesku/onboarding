@@ -1,0 +1,109 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowS3ForStateAndArtifacts",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket",
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Resource": [
+        "arn:aws:s3:::tf-state-lead-prod",
+        "arn:aws:s3:::tf-state-lead-prod/*",
+        "arn:aws:s3:::my-lambda-artifacts-lead",
+        "arn:aws:s3:::my-lambda-artifacts-lead/*"
+      ]
+    },
+    {
+      "Sid": "AllowDDBLock",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:PutItem",
+        "dynamodb:GetItem",
+        "dynamodb:DeleteItem",
+        "dynamodb:Query",
+        "dynamodb:UpdateItem"
+      ],
+      "Resource": "arn:aws:dynamodb:us-east-1:699041963732:table/tf-state-locks"
+    },
+    {
+      "Sid": "AllowLambdaMgmt",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:PublishVersion",
+        "lambda:AddPermission",
+        "lambda:DeleteFunction"
+      ],
+      "Resource": "arn:aws:lambda:us-east-1:699041963732:function:*"
+    },
+    {
+      "Sid": "AllowAPIGatewayMgmt",
+      "Effect": "Allow",
+      "Action": [
+        "apigateway:*",
+        "apigatewayv2:*"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSqsMgmt",
+      "Effect": "Allow",
+      "Action": [
+        "sqs:*"
+      ],
+      "Resource": "arn:aws:sqs:us-east-1:699041963732:*"
+    },
+    {
+      "Sid": "AllowCloudWatch",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DeleteAlarms",
+        "cloudwatch:DescribeAlarms",
+        "logs:CreateLogGroup",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowSecretsManager",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:PutSecretValue",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:GetSecretValue",
+        "secretsmanager:DescribeSecret"
+      ],
+      "Resource": "arn:aws:secretsmanager:us-east-1:699041963732:secret:onboarding/*"
+    },
+    {
+      "Sid": "AllowIAMManagementForTerraform",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:DeleteRole",
+        "iam:PutRolePolicy",
+        "iam:AttachRolePolicy",
+        "iam:DetachRolePolicy",
+        "iam:CreatePolicy",
+        "iam:DeletePolicy",
+        "iam:UpdateAssumeRolePolicy",
+        "iam:GetRole",
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::699041963732:role/onboarding-*",
+        "arn:aws:iam::699041963732:policy/onboarding-*",
+        "arn:aws:iam::699041963732:role/GitHubActionsDeployRole"
+      ]
+    }
+  ]
+}

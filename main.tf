@@ -142,10 +142,8 @@ resource "aws_iam_role" "op_sqs_role" {
     Version = "2012-10-17"
     Statement = [{
       Effect = "Allow",
-      Principal = {
-        Service = "ec2.amazonaws.com"
-        Action  = "sts:AssumeRole"
-      },
+      Principal = {Service = "ec2.amazonaws.com"},
+      Action  = "sts:AssumeRole"
     }]
   })
 }
