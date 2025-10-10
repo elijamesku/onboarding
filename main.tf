@@ -87,12 +87,14 @@ resource "aws_iam_role_policy_attachment" "lambda_s3_write" {
 ##      Lambda Function       ##
 ################################
 resource "aws_lambda_function" "onboarding" {
-  filename      = "lambda.zip"
   function_name = "onboarding-lambda"
   role          = aws_iam_role.lambda_exec.arn
   handler       = "index.handler"
   runtime       = "nodejs18.x"
   timeout       = 10
+
+  s3_bucket = var.lambda_artifact_bucket
+  s3_key    = var.lambda_s3_key
 
   environment {
     variables = {
@@ -103,6 +105,7 @@ resource "aws_lambda_function" "onboarding" {
     }
   }
 }
+
 
 ################################
 ##     API Gateway (HTTP)     ##
