@@ -2,6 +2,16 @@ provider "aws" {
   region = var.aws_region
 }
 
+terraform {
+  backend "s3" {
+    bucket         = "tf-state-bucket"
+    key            = "onboarding/terraform.tfstate"
+    region         = "us-east-1"
+    dynamodb_table = "terraform-locks"
+    encrypt        = true
+  }
+}
+
 ################################
 ##         SQS Queue          ##
 ################################
@@ -52,12 +62,6 @@ resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
 }
 
-resource "aws_iam_role_policy_attachment" "lambda_s3_write" {
-  role       = aws_iam_role.lambda_exec.name
-  policy_arn = aws_iam_policy.lambda_s3_write_policy.arn
-}
-
-
 ################################
 ##  IAM Policy for S3 Write   ##
 ################################
@@ -68,10 +72,16 @@ resource "aws_iam_policy" "s3_write_policy" {
     Statement = [{
       Effect   = "Allow"
       Action   = ["s3:PutObject", "s3:GetObject"]
-      Resource = "${aws_s3_bucket.onboarding_logs.arn}"
+      Resource = "${aws_s3_bucket.onboarding_logs.arn}/jobs/*"
     }]
   })
 }
+
+resource "aws_iam_role_policy_attachment" "lambda_s3_write" {
+  role       = aws_iam_role.lambda_exec.name
+  policy_arn = aws_iam_policy.s3_write_policy.arn
+}
+
 
 ################################
 ##      Lambda Function       ##
@@ -89,7 +99,7 @@ resource "aws_lambda_function" "onboarding" {
       API_KEY       = var.lambda_api_key
       SQS_QUEUE_URL = aws_sqs_queue.newhire_queue.id
       AWS_REGION    = var.aws_region
-      LOG_BUCKET    = aws_s3_bucket.onboarding_logs.id
+      LOG_BUCKET    = aws_s3_bucket.onboarding_logs.bucket
     }
   }
 }
@@ -120,7 +130,7 @@ resource "aws_lambda_permission" "apigw" {
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.onboarding.function_name
   principal     = "apigateway.amazonaws.com"
-  source_arn    = aws_apigatewayv2_api.onboarding_api.execution_arn
+  source_arn    = "${aws_apigatewayv2_api.onboarding_api.execution_arn}/*/*"
 }
 
 ################################
@@ -131,11 +141,11 @@ resource "aws_iam_role" "op_sqs_role" {
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
     Statement = [{
-      Effect = "Allow"
+      Effect = "Allow",
       Principal = {
         Service = "ec2.amazonaws.com"
         Action  = "sts:AssumeRole"
-      }
+      },
     }]
   })
 }
