@@ -12,4 +12,4 @@ terraform.rc
 # Python
 .venv/
 __pycache__/
-*.pyc
+*.pyc.terraform/
