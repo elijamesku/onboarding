@@ -51,11 +51,29 @@ resource "aws_iam_role" "lambda_exec" {
   })
 }
 
-# Attaching the policies to lambda
+# Least-privilege SQS policy for Lambda (SendMessage)
+resource "aws_iam_policy" "lambda_sqs_policy" {
+  name = "onboarding-lambda-sqs"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "sqs:SendMessage",
+          "sqs:GetQueueAttributes"
+        ],
+        Resource = aws_sqs_queue.newhire_queue.arn
+      }
+    ]
+  })
+}
+
 resource "aws_iam_role_policy_attachment" "lambda_sqs" {
   role       = aws_iam_role.lambda_exec.name
-  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonSQSFullAccess"
+  policy_arn = aws_iam_policy.lambda_sqs_policy.arn
 }
+
 
 resource "aws_iam_role_policy_attachment" "lambda_basic_execution" {
   role       = aws_iam_role.lambda_exec.name
@@ -100,7 +118,6 @@ resource "aws_lambda_function" "onboarding" {
     variables = {
       API_KEY       = var.lambda_api_key
       SQS_QUEUE_URL = aws_sqs_queue.newhire_queue.id
-      AWS_REGION    = var.aws_region
       LOG_BUCKET    = aws_s3_bucket.onboarding_logs.bucket
     }
   }
