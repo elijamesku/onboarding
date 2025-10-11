@@ -1,0 +1,8 @@
+{
+  "name": "onboarding-lambda",
+  "version": "1.0.0",
+  "dependencies": {
+    "@aws-sdk/client-sqs": "^3.380.0",
+    "@aws-sdk/client-s3": "^3.380.0"
+  }
+}
