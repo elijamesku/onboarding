@@ -13,3 +13,8 @@ terraform.rc
 .venv/
 __pycache__/
 *.pyc.terraform/
+
+#node
+node_modules/
+*.log
+.DS_Store

@@ -19,5 +19,5 @@ variable "lambda_artifact_bucket" {
 
 variable "lambda_s3_key" {
   type = string
-  description = "S3 key for the lambda artifact, set by CI (e.g. onboarding/lambda-<sha>.zip)"
+  default = "onboarding/jscode/lambda.zip"
 }

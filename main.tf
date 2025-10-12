@@ -117,7 +117,7 @@ resource "aws_lambda_function" "onboarding" {
   environment {
     variables = {
       API_KEY       = var.lambda_api_key
-      SQS_QUEUE_URL = aws_sqs_queue.newhire_queue.id
+      SQS_QUEUE_URL = aws_sqs_queue.newhire_queue.url
       LOG_BUCKET    = aws_s3_bucket.onboarding_logs.bucket
     }
   }
