@@ -56,7 +56,7 @@ function onFormSubmit(e) {
     // Optionally write response back to Sheet (append or set in a column) - omitted by default
     return { status: code, body: body };
   } catch (err) {
-    // Log error so you can inspect it in Executions
+    // Log error so we can inspect it in Executions
     console.error('onFormSubmit error:', err);
     throw err; // rethrow so Apps Script failure is visible in Executions
   }
@@ -64,7 +64,7 @@ function onFormSubmit(e) {
 
 /**
  * Test helper 
- * Call testPayload() from the editor to run
+ * Calling testPayload() from the editor to run
  */
 function testPayload() {
   const fakeEvent = {
