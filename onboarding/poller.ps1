@@ -211,6 +211,24 @@ try {
                 if ($sam.Length -gt 20) { $sam = $sam.Substring(0,20) }
             }
 
+            
+            # Determine the OU path based on the template user's location
+            try {
+                $templateUser = Get-ADUser -Identity $newUserProps['TemplateUser'] -Properties DistinguishedName -ErrorAction Stop
+                $dn = $templateUser.DistinguishedName
+                $ouStart = $dn.IndexOf("OU=")
+                if ($ouStart -ge 0) {
+                    $targetOUPath = $dn.Substring($ouStart)
+                    Log "Template user located in OU: $targetOUPath"
+                } else {
+                    Log "Template user DN did not contain OU= segment; falling back to default OU path" "WARN"
+                    $targetOUPath = $OUPath  # fallback
+                }
+            } catch {
+                Log "Failed to get OU for template user ($($newUserProps['TemplateUser'])): $_" "WARN"
+                $targetOUPath = $OUPath
+            }
+
             # prep the New-ADUser parameters
             $newUserParams = @{
                 Name = $newUserProps['DisplayName'] ?: ($givenName + " " + $sn)
@@ -220,10 +238,11 @@ try {
                 Surname = $newUserProps['Surname']
                 DisplayName = $newUserProps['DisplayName']
                 Enabled = $false  # enable after password set
-                Path = $OUPath
+                Path = $targetOUPath   
                 AccountPassword = (ConvertTo-SecureString (New-RandomPassword -Length $PasswordLength) -AsPlainText -Force)
                 PasswordNeverExpires = $false
             }
+
 
             # add other optional attributes if present
             foreach ($k in $newUserProps.Keys) {
