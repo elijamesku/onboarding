@@ -8,7 +8,7 @@
 const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 
 /**
- * Required Script Properties (to fill in once i complete every other step)
+ * Required Script Properties:
  * API_KEY                >>>>> API key for Lambda/API Gateway
  * API_GATEWAY_URL        >>>>> full invoke URL (include /$default/newuser if needed)
  * TEMPLATE_SHEET_ID      >>>>> Google Sheet ID that contains the Templates sheet
@@ -32,7 +32,7 @@ function getConfig() {
 }
 
 /**
- * Reading the template mapping user from Google Sheet 
+ * Read template mapping from Google Sheet.
  * Returns { onPremId, cloudUPN, onPremGroups:[], cloudGroups:[] }
  */
 function getTemplateInfo(jobTitle) {
@@ -81,8 +81,8 @@ function getTemplateInfo(jobTitle) {
 }
 
 /**
- * Optionally append a row to a "NewHires" Google Sheet for visibility/audit
- * The polling/post-sync still relies on the EC2-created NewHires.csv; this is just an optional UI copy
+ * Optionally append a row to a "NewHires" Google Sheet for visibility/audit.
+ * The polling/post-sync still relies on the EC2-created NewHires.csv; this is just an optional UI copy.
  */
 function appendToNewHiresSheet(upn, jobTitle, templateOnPremId, templateCloudUPN) {
   const cfg = getConfig();
@@ -117,14 +117,14 @@ function onFormSubmit(e) {
     const template = getTemplateInfo(jobTitle);
 
     const givenName = values["Employee's Name"] ? values["Employee's Name"][0].split(" ")[0] : "";
-    const familyName = values["Employee's Family Name"] ? values["Employee's Family Name"][0] : "";
     const displayName = values["Employee's Name"] ? values["Employee's Name"][0] : "";
     const upn = values["Employee's LEAD Email Address"] ? values["Employee's LEAD Email Address"][0] : "";
     const mailNickname = upn ? upn.split('@')[0] : "";
 
-    // Build payload with on-prem groups (memberOf) and cloud-only groups (cloudGroups)
     const payload = {
       requestId: Utilities.getUuid(),
+
+      // Template user info
       templateUserId: template.onPremId || null,
       templateCloudUPN: template.cloudUPN || null,
 
@@ -144,21 +144,14 @@ function onFormSubmit(e) {
       country: values["Employee Country"] ? values["Employee Country"][0] : "",
       manager: values["Manager UPN"] ? values["Manager UPN"][0] : "",
 
-      // memberOf (on-prem groups) and cloudGroups (cloud-only groups) are populated from the Templates sheet
+      // On-prem & cloud groups
       memberOf: template.onPremGroups || [],
       cloudGroups: template.cloudGroups || [],
 
-      // requester (who submitted the form)
+      // requester info
       requesterEmail: (e.values && e.values[0]) ? e.values[0] : Session.getActiveUser().getEmail()
     };
 
-    // Optional: append to a visibility NewHires sheet (not required for poller)
-    try {
-      appendToNewHiresSheet(payload.userPrincipalName, jobTitle, payload.templateUserId, payload.templateCloudUPN);
-    } catch (err) {
-      // don't fail the whole submit for UI logging failures
-      console.warn('Failed to append to NewHires sheet:', err);
-    }
 
     // Send payload to API Gateway / Lambda
     const options = {
@@ -204,8 +197,7 @@ function testPayload() {
       "Employee City": ["New York"],
       "Employee State": ["NY"],
       "Employee Postal Code": ["10001"],
-      "Employee Country": ["USA"],
-      "Employee ID": ["E12345"],
+      "Employee Country": ["United States"],
       "Manager UPN": ["manager@company.com"]
     },
     values: ["manager@example.com"]
@@ -213,4 +205,16 @@ function testPayload() {
 
   const result = onFormSubmit(fakeEvent);
   Logger.log('testPayload result: %s', JSON.stringify(result));
+}
+// comment out fully eventually(used to test)
+function testSheetAccess() {
+  const id = PropertiesService.getScriptProperties().getProperty('TEMPLATE_SHEET_ID');
+  const ss = SpreadsheetApp.openById(id);
+  Logger.log('Spreadsheet name: ' + ss.getName());
+  const sheet = ss.getSheetByName('Templates');
+  if (sheet) {
+    Logger.log('Templates sheet found! Row count: ' + sheet.getLastRow());
+  } else {
+    Logger.log('Templates sheet NOT found.');
+  }
 }
