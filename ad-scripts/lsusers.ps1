@@ -1,3 +1,4 @@
+# Script written to extract params from AD onto a CSV 
 # Domain Controller
 $DC = "leaving-empty-since-repo-is-public"
 
