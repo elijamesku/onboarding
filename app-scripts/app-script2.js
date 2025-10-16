@@ -108,6 +108,17 @@ function onFormSubmit() {
     const sheet = ss.getSheetByName('Form Responses 1');
     if (!sheet) throw new Error('Form Responses 1 sheet not found.');
 
+    /*
+    $$$$$Dont run if the reason for request isnt set for "onboarding" (prod solution)
+    const reason = getValue(values, "Reason for the request:").trim().toLowerCase();
+
+    $$$$$Only continue if reason is 'onboarding'
+    if (reason !== 'onboarding') {
+      Logger.log(`Skipping submission: reason is "${reason}"`);
+      return; $$$$$$ Stop execution here
+    }
+ */
+
     const lastRow = sheet.getLastRow();
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const rowValues = sheet.getRange(lastRow, 1, 1, sheet.getLastColumn()).getValues()[0];
