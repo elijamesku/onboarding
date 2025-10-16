@@ -1,220 +1,227 @@
 /*******************************
  * Apps Script: onFormSubmit handler
- * - Reads template mapping from a Google Sheet ("Templates")
- * - Builds payload with on-prem groups (memberOf) and cloud groups
- * - Optionally appends a row to a Google Sheet "NewHires" for visibility
+ * - Uses "List user to mirror access" to find a template row in the Templates sheet
+ * - New: supports a "Name" column (human-friendly name) for matching what managers type
+ * - Pulls OnPremGroups from the matched template row and includes them as `memberOf`
+ * - Only runs when "Reason for request" contains "Onboarding"
+ *
+ * Templates sheet (sheet name = "Templates") columns (A..F):
+ *   TemplateTitle | Name | OnPremTemplateId | CloudTemplateUPN | OnPremGroups | CloudGroups
+ *   - Name: human friendly name (e.g. "Eli James") that matches what manager types into "List user to mirror access"
+ *   - OnPremGroups and CloudGroups are comma-separated lists (group display names or CNs)
  *******************************/
 
 const SCRIPT_PROPS = PropertiesService.getScriptProperties();
 
-/**
- * Required Script Properties:
- * API_KEY                >>>>> API key for Lambda/API Gateway
- * API_GATEWAY_URL        >>>>> full invoke URL (include /$default/newuser if needed)
- * TEMPLATE_SHEET_ID      >>>>> Google Sheet ID that contains the Templates sheet
- * OPTIONAL_NEWHIRES_SHEET_ID (optional) >>>>> Google Sheet ID where we append visible NewHires rows (if set)
- *
- * Templates sheet layout (sheet name = "Templates"):
- * Header row (A1:D1): TemplateTitle | OnPremTemplateId | CloudTemplateUPN | OnPremGroups | CloudGroups
- * OnPremGroups and CloudGroups are comma-separated lists of group names (or CNs as preferred)
- */
-
+/** Return config (throws if required props missing) */
 function getConfig() {
   const apiKey = SCRIPT_PROPS.getProperty('API_KEY');
   const apiUrl = SCRIPT_PROPS.getProperty('API_GATEWAY_URL');
   const templateSheetId = SCRIPT_PROPS.getProperty('TEMPLATE_SHEET_ID');
-  const newHiresSheetId = SCRIPT_PROPS.getProperty('OPTIONAL_NEWHIRES_SHEET_ID'); // optional
+  const newHiresSheetId = SCRIPT_PROPS.getProperty('OPTIONAL_NEWHIRES_SHEET_ID');
 
   if (!apiUrl) throw new Error('Missing Script Property: API_GATEWAY_URL.');
-  if (!templateSheetId) throw new Error('Missing Script Property: TEMPLATE_SHEET_ID. Create a Google Sheet with name "Templates".');
+  if (!templateSheetId) throw new Error('Missing Script Property: TEMPLATE_SHEET_ID.');
 
   return { apiKey, apiUrl, templateSheetId, newHiresSheetId };
 }
 
 /**
- * Read template mapping from Google Sheet.
- * Returns { onPremId, cloudUPN, onPremGroups:[], cloudGroups:[] }
+ * Read template mapping from Google Sheet "Templates".
+ * Matching priority:
+ *   1) mirrorKey (exact case-insensitive match) against TemplateTitle, Name, OnPremTemplateId, CloudTemplateUPN
+ *   2) jobTitle fallback matching TemplateTitle
+ *
+ * Returns: { onPremId, cloudUPN, onPremGroups:[], cloudGroups:[] }
  */
-function getTemplateInfo(jobTitle) {
+function getTemplateInfo(jobTitle, mirrorKey) {
   const cfg = getConfig();
   const ss = SpreadsheetApp.openById(cfg.templateSheetId);
   const sheet = ss.getSheetByName('Templates');
-  if (!sheet) throw new Error('Templates sheet not found. Create sheet named "Templates".');
+  if (!sheet) throw new Error('Templates sheet not found. Create a sheet named "Templates".');
 
   const data = sheet.getDataRange().getValues(); // 2D array
   if (data.length < 2) {
-    // no rows
-    return {
-      onPremId: null,
-      cloudUPN: null,
-      onPremGroups: [],
-      cloudGroups: []
-    };
+    return { onPremId: null, cloudUPN: null, onPremGroups: [], cloudGroups: [] };
   }
 
-  // assume header row at index 0, columns:
-  // 0 = TemplateTitle, 1 = OnPremTemplateId, 2 = CloudTemplateUPN, 3 = OnPremGroups, 4 = CloudGroups
-  for (let r = 1; r < data.length; r++) {
-    const row = data[r];
-    if (!row || !row[0]) continue;
-    if (String(row[0]).trim() === String(jobTitle).trim()) {
-      const onPremId = row[1] ? String(row[1]).trim() : null;
-      const cloudUPN = row[2] ? String(row[2]).trim() : null;
-      const onPremGroups = row[3] ? String(row[3]).split(',').map(s => s.trim()).filter(Boolean) : [];
-      const cloudGroups = row[4] ? String(row[4]).split(',').map(s => s.trim()).filter(Boolean) : [];
-      return {
-        onPremId,
-        cloudUPN,
-        onPremGroups,
-        cloudGroups
-      };
+  // Normalize helper (null-safe, lower-case trimmed)
+  const norm = (v) => (v === undefined || v === null) ? '' : String(v).trim().toLowerCase();
+
+  // Try mirrorKey first (if provided)
+  if (mirrorKey && String(mirrorKey).trim() !== '') {
+    const mk = norm(mirrorKey);
+    for (let r = 1; r < data.length; r++) {
+      const row = data[r];
+      if (!row) continue;
+      const title = norm(row[0]);       // TemplateTitle (col A)
+      const nameCol = norm(row[1]);    // Name (col B) - human friendly
+      const onPremId = norm(row[2]);   // OnPremTemplateId (col C)
+      const cloudUpn = norm(row[3]);   // CloudTemplateUPN (col D)
+      if (mk === title || mk === nameCol || mk === onPremId || mk === cloudUpn) {
+        return {
+          onPremId: row[2] ? String(row[2]).trim() : null,
+          cloudUPN: row[3] ? String(row[3]).trim() : null,
+          onPremGroups: row[4] ? String(row[4]).split(',').map(s => s.trim()).filter(Boolean) : [],
+          cloudGroups: row[5] ? String(row[5]).split(',').map(s => s.trim()).filter(Boolean) : []
+        };
+      }
     }
   }
 
-  // fallback default
-  return {
-    onPremId: null,
-    cloudUPN: null,
-    onPremGroups: [],
-    cloudGroups: []
-  };
+  // Fallback: match jobTitle to TemplateTitle
+  if (jobTitle && String(jobTitle).trim() !== '') {
+    const jt = norm(jobTitle);
+    for (let r = 1; r < data.length; r++) {
+      const row = data[r];
+      if (!row) continue;
+      const title = norm(row[0]);
+      if (jt === title) {
+        return {
+          onPremId: row[2] ? String(row[2]).trim() : null,
+          cloudUPN: row[3] ? String(row[3]).trim() : null,
+          onPremGroups: row[4] ? String(row[4]).split(',').map(s => s.trim()).filter(Boolean) : [],
+          cloudGroups: row[5] ? String(row[5]).split(',').map(s => s.trim()).filter(Boolean) : []
+        };
+      }
+    }
+  }
+
+  // not found
+  return { onPremId: null, cloudUPN: null, onPremGroups: [], cloudGroups: [] };
 }
 
-/**
- * Optionally append a row to a "NewHires" Google Sheet for visibility/audit.
- * The polling/post-sync still relies on the EC2-created NewHires.csv; this is just an optional UI copy.
- */
+/** Optional: append minimal visibility row into a NewHires sheet (not required by poller) */
 function appendToNewHiresSheet(upn, jobTitle, templateOnPremId, templateCloudUPN) {
   const cfg = getConfig();
   const newHiresSheetId = cfg.newHiresSheetId;
-  if (!newHiresSheetId) return; // feature disabled
+  if (!newHiresSheetId) return;
 
   try {
     const ss = SpreadsheetApp.openById(newHiresSheetId);
     let sheet = ss.getSheetByName('NewHires');
     if (!sheet) {
       sheet = ss.insertSheet('NewHires');
-      // Add header
       sheet.appendRow(['Timestamp','UserPrincipalName','JobTitle','TemplateOnPremId','TemplateCloudUPN']);
     }
     const ts = new Date();
     sheet.appendRow([ts.toISOString(), upn, jobTitle, templateOnPremId || '', templateCloudUPN || '']);
   } catch (err) {
-    // Non-fatal; just log
     console.error('appendToNewHiresSheet error:', err);
   }
 }
 
-/**
- * Trigger function bound to Google Form submit
- */
+/** Safe field reader that tolerates small differences in question text (case/spacing/colon) */
+function readField(valuesObj, name) {
+  if (!valuesObj) return '';
+  if (valuesObj[name]) return valuesObj[name][0];
+  const keys = Object.keys(valuesObj || {});
+  const low = name.toLowerCase().trim();
+  const alt = keys.find(k => k && k.toLowerCase().trim() === low);
+  return alt ? valuesObj[alt][0] : '';
+}
+
+/** Main onFormSubmit handler */
 function onFormSubmit(e) {
   try {
     const values = (e.namedValues || {});
-    const props = getConfig();
+    const cfg = getConfig();
 
-    const jobTitle = values["Employee Job Title"] ? values["Employee Job Title"][0] : "TEMPLATE_DEFAULT";
-    const template = getTemplateInfo(jobTitle);
+    // Only run for onboarding requests
+    const reason = readField(values, "Reason for request");
+    if (!reason || !String(reason).toLowerCase().includes("onboarding")) {
+      Logger.log("Skipping run — not an onboarding request. Reason: " + reason);
+      return;
+    }
 
-    const givenName = values["Employee's Name"] ? values["Employee's Name"][0].split(" ")[0] : "";
-    const displayName = values["Employee's Name"] ? values["Employee's Name"][0] : "";
-    const upn = values["Employee's LEAD Email Address"] ? values["Employee's LEAD Email Address"][0] : "";
-    const mailNickname = upn ? upn.split('@')[0] : "";
+    // Read required form fields (accept some common punctuation variants)
+    const employeeName = readField(values, "Employee Name");
+    const jobTitle = readField(values, "Employee Job Title");
+    const upnField = readField(values, "Employee's LEAD Email Address:") || readField(values, "Employee's LEAD Email Address");
+    const supervisor = readField(values, "Employee's Supervisor:") || readField(values, "Employee's Supervisor");
+    const mirrorTyped = readField(values, "List user to mirror access"); // manager typed template identifier (now can be the human Name column)
+    const location = readField(values, "Employee Location");
+
+    // Lookup template in Spreadsheet (mirrorTyped takes precedence)
+    const template = getTemplateInfo(jobTitle, mirrorTyped);
+
+    // Build AD-focused payload
+    const givenName = employeeName ? String(employeeName).split(' ')[0] : '';
+    const displayName = employeeName || '';
+    const mailNickname = upnField ? String(upnField).split('@')[0] : '';
 
     const payload = {
       requestId: Utilities.getUuid(),
 
-      // Template user info
+      // Template info (for poller)
       templateUserId: template.onPremId || null,
       templateCloudUPN: template.cloudUPN || null,
 
-      // Core AD attributes
+      // Core AD attributes from form
       givenName: givenName,
       displayName: displayName,
-      userPrincipalName: upn,
+      userPrincipalName: upnField || '',
       mailNickname: mailNickname,
-      title: jobTitle,
-      department: values["Employee Department"] ? values["Employee Department"][0] : "",
-      company: values["Employee Company"] ? values["Employee Company"][0] : "Lead Bank",
-      physicalDeliveryOfficeName: values["Employee Location"] ? values["Employee Location"][0] : "",
-      streetAddress: values["Shipping Address"] ? values["Shipping Address"][0] : "",
-      city: values["Employee City"] ? values["Employee City"][0] : "",
-      state: values["Employee State"] ? values["Employee State"][0] : "",
-      postalCode: values["Employee Postal Code"] ? values["Employee Postal Code"][0] : "",
-      country: values["Employee Country"] ? values["Employee Country"][0] : "",
-      manager: values["Manager UPN"] ? values["Manager UPN"][0] : "",
+      title: jobTitle || '',
+      manager: supervisor || '',
+      physicalDeliveryOfficeName: location || '',
 
-      // On-prem & cloud groups
+      // <-- IMPORTANT: memberOf comes from the matched template row's OnPremGroups column
       memberOf: template.onPremGroups || [],
+
+      // cloudGroups from templates sheet (optional -- for post-sync)
       cloudGroups: template.cloudGroups || [],
 
-      // requester info
-      requesterEmail: (e.values && e.values[0]) ? e.values[0] : Session.getActiveUser().getEmail()
+      // For audit / fallback
+      mirrorUserTyped: mirrorTyped || '',
+      requesterEmail: (e.values && e.values[0]) ? e.values[0] : Session.getActiveUser().getEmail(),
+      reasonForRequest: reason || ''
     };
 
+    // Optional UI append (not required for poller)
+    try {
+      appendToNewHiresSheet(payload.userPrincipalName, jobTitle, payload.templateUserId, payload.templateCloudUPN);
+    } catch (err) {
+      console.warn('Failed to append to NewHires sheet:', err);
+    }
 
-    // Send payload to API Gateway / Lambda
+    // Send payload to API Gateway > Lambda > SQS
     const options = {
       method: 'post',
       contentType: 'application/json',
       payload: JSON.stringify(payload),
-      headers: {
-        'x-api-key': props.apiKey || ''
-      },
+      headers: { 'x-api-key': cfg.apiKey || '' },
       muteHttpExceptions: true,
       timeout: 30000
     };
 
-    const response = UrlFetchApp.fetch(props.apiUrl, options);
-    const code = response.getResponseCode();
-    const body = response.getContentText();
+    const response = UrlFetchApp.fetch(cfg.apiUrl, options);
+    Logger.log(`POST ${cfg.apiUrl} -> ${response.getResponseCode()}`);
+    Logger.log(response.getContentText());
 
-    Logger.log(`POST ${props.apiUrl} -> ${code}`);
-    Logger.log(body);
+    return { status: response.getResponseCode(), body: response.getContentText() };
 
-    return { status: code, body: body };
   } catch (err) {
     console.error('onFormSubmit error:', err);
     throw err;
   }
 }
 
-/**
- * Test helper 
- */
+/** Test helper to run locally in the editor */
 function testPayload() {
   const fakeEvent = {
     namedValues: {
-      "Employee's Name": ["Jane Doe"],
-      "Employee's Family Name": ["Doe"],
-      "Employee Job Title": ["Software Engineer III"],
-      "Employee's LEAD Email Address": ["jane.doe@lead.bank"],
-      "Employee Location": ["NYC"],
-      "Shipping Address": ["123 Main St, NY"],
-      "Employee Department": ["Engineering"],
-      "Employee Company": ["Lead Bank"],
-      "Employee Phone": ["555-1234"],
-      "Employee City": ["New York"],
-      "Employee State": ["NY"],
-      "Employee Postal Code": ["10001"],
-      "Employee Country": ["United States"],
-      "Manager UPN": ["manager@company.com"]
+      "Employee Name": ["Elias James"],
+      "Employee Job Title": ["IT Helpdesk Specialist"],
+      "Employee's LEAD Email Address:": ["eliasj@lead.bank"],
+      "Employee's Supervisor:": ["roscoe@lead.bank"],
+      "List user to mirror access": ["Eli James"], 
+      "Employee Location": ["Chapman Farms"],
+      "Reason for request": ["Onboarding"]
     },
-    values: ["manager@example.com"]
+    values: ["roscoe@lead.bank"]
   };
 
   const result = onFormSubmit(fakeEvent);
   Logger.log('testPayload result: %s', JSON.stringify(result));
-}
-// comment out fully eventually(used to test)
-function testSheetAccess() {
-  const id = PropertiesService.getScriptProperties().getProperty('TEMPLATE_SHEET_ID');
-  const ss = SpreadsheetApp.openById(id);
-  Logger.log('Spreadsheet name: ' + ss.getName());
-  const sheet = ss.getSheetByName('Templates');
-  if (sheet) {
-    Logger.log('Templates sheet found! Row count: ' + sheet.getLastRow());
-  } else {
-    Logger.log('Templates sheet NOT found.');
-  }
 }
