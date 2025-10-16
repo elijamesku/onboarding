@@ -1,7 +1,7 @@
 /*******************************
- * Apps Script: onFormSubmit handler (sheet-driven, robust)
- * - Reads last row from NewHires sheet (form responses)
- * - Looks up template from Templates sheet
+ * Apps Script: onFormSubmit handler
+ * - Normalizes headers and trims spaces
+ * - Looks up Templates sheet reliably
  * - Builds payload and sends to API Gateway
  *******************************/
 
@@ -21,7 +21,7 @@ function getConfig() {
   return { apiKey, apiUrl, templateSheetId, newHiresSheetId };
 }
 
-/** Read template mapping from Google Sheet "Templates" */
+/** Read template mapping from Templates sheet */
 function getTemplateInfo(jobTitle, mirrorKey) {
   const cfg = getConfig();
   const ss = SpreadsheetApp.openById(cfg.templateSheetId);
@@ -31,48 +31,51 @@ function getTemplateInfo(jobTitle, mirrorKey) {
   const data = sheet.getDataRange().getValues();
   if (data.length < 2) return { onPremId: null, cloudUPN: null, onPremGroups: [], cloudGroups: [] };
 
-  const norm = (v) => (v === undefined || v === null) ? '' : String(v).trim().toLowerCase();
+  const normalize = v => v ? String(v).trim().toLowerCase() : '';
 
   // Try mirrorKey first
   if (mirrorKey && mirrorKey.trim() !== '') {
-    const mk = norm(mirrorKey);
+    const mk = normalize(mirrorKey);
     for (let r = 1; r < data.length; r++) {
       const row = data[r];
       if (!row) continue;
-      const title = norm(row[0]);      // TemplateTitle
-      const nameCol = norm(row[5]);    // Name column
-      const onPremId = norm(row[1]);   // OnPremTemplateId
-      const cloudUpn = norm(row[2]);   // CloudTemplateUPN
-      if (mk === title || mk === nameCol || mk === onPremId || mk === cloudUpn) {
-        return {
-          onPremId: row[1] ? String(row[1]).trim() : null,
-          cloudUPN: row[2] ? String(row[2]).trim() : null,
-          onPremGroups: row[3] ? String(row[3]).split(',').map(s => s.trim()).filter(Boolean) : [],
-          cloudGroups: row[4] ? String(row[4]).split(',').map(s => s.trim()).filter(Boolean) : []
-        };
+      const templateTitle = normalize(row[0]);
+      const onPremId = row[1] ? String(row[1]).trim() : null;
+      const cloudUpn = row[2] ? String(row[2]).trim() : null;
+      const onPremGroups = row[3] ? String(row[3]).split(',').map(s => s.trim()).filter(Boolean) : [];
+      const cloudGroups = row[4] ? String(row[4]).split(',').map(s => s.trim()).filter(Boolean) : [];
+      const nameCol = row[5] ? normalize(row[5]) : '';
+
+      if (mk === templateTitle || mk === nameCol || mk === normalize(onPremId) || mk === normalize(cloudUpn)) {
+        return { onPremId, cloudUPN: cloudUpn, onPremGroups, cloudGroups };
       }
     }
   }
 
   // Fallback: match jobTitle to TemplateTitle
   if (jobTitle && jobTitle.trim() !== '') {
-    const jt = norm(jobTitle);
+    const jt = normalize(jobTitle);
     for (let r = 1; r < data.length; r++) {
       const row = data[r];
       if (!row) continue;
-      const title = norm(row[0]);
-      if (jt === title) {
-        return {
-          onPremId: row[1] ? String(row[1]).trim() : null,
-          cloudUPN: row[2] ? String(row[2]).trim() : null,
-          onPremGroups: row[3] ? String(row[3]).split(',').map(s => s.trim()).filter(Boolean) : [],
-          cloudGroups: row[4] ? String(row[4]).split(',').map(s => s.trim()).filter(Boolean) : []
-        };
+      const templateTitle = normalize(row[0]);
+      if (jt === templateTitle) {
+        const onPremId = row[1] ? String(row[1]).trim() : null;
+        const cloudUpn = row[2] ? String(row[2]).trim() : null;
+        const onPremGroups = row[3] ? String(row[3]).split(',').map(s => s.trim()).filter(Boolean) : [];
+        const cloudGroups = row[4] ? String(row[4]).split(',').map(s => s.trim()).filter(Boolean) : [];
+        return { onPremId, cloudUPN: cloudUpn, onPremGroups, cloudGroups };
       }
     }
   }
 
   return { onPremId: null, cloudUPN: null, onPremGroups: [], cloudGroups: [] };
+}
+
+/** Normalize and get a field from the sheet values */
+function getValue(valuesObj, key) {
+  const foundKey = Object.keys(valuesObj).find(k => k.trim().toLowerCase() === key.toLowerCase());
+  return foundKey ? valuesObj[foundKey][0] : '';
 }
 
 /** Optional: append to NewHires sheet */
@@ -83,9 +86,9 @@ function appendToNewHiresSheet(upn, jobTitle, templateOnPremId, templateCloudUPN
 
   try {
     const ss = SpreadsheetApp.openById(newHiresSheetId);
-    let sheet = ss.getSheetByName('NewHires');
+    let sheet = ss.getSheetByName('Form Responses 1');
     if (!sheet) {
-      sheet = ss.insertSheet('NewHires');
+      sheet = ss.insertSheet('Form Responses 1');
       sheet.appendRow(['Timestamp','UserPrincipalName','JobTitle','TemplateOnPremId','TemplateCloudUPN']);
     }
     const ts = new Date();
@@ -95,27 +98,21 @@ function appendToNewHiresSheet(upn, jobTitle, templateOnPremId, templateCloudUPN
   }
 }
 
-/** Safe field reader */
-function readField(valuesObj, name) {
-  if (!valuesObj) return '';
-  return valuesObj[name] || '';
-}
-
-/** Main onFormSubmit handler (sheet-driven) */
+/** Main onFormSubmit handler */
 function onFormSubmit() {
   try {
     const cfg = getConfig();
 
-    // Pull last row from NewHires sheet (form responses)
+    // Pull last row from NewHires sheet
     const ss = SpreadsheetApp.openById(cfg.newHiresSheetId);
-    const sheet = ss.getSheetByName('NewHires');
-    if (!sheet) throw new Error('NewHires sheet not found.');
+    const sheet = ss.getSheetByName('Form Responses 1');
+    if (!sheet) throw new Error('Form Responses 1 sheet not found.');
 
     const lastRow = sheet.getLastRow();
     const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
     const rowValues = sheet.getRange(lastRow, 1, 1, sheet.getLastColumn()).getValues()[0];
 
-    // Build values object (like e.namedValues)
+    // Build a normalized values object
     const values = {};
     headers.forEach((h, i) => {
       if (h) values[h] = [rowValues[i]];
@@ -123,13 +120,13 @@ function onFormSubmit() {
 
     Logger.log('Form values pulled from Sheet: %s', JSON.stringify(values, null, 2));
 
-    // Extract fields
-    const employeeName = values["Employee Name"] ? values["Employee Name"][0] : '';
-    const jobTitle = values["JobTitle"] ? values["JobTitle"][0] : '';
-    const upnField = values["UserPrincipalName"] ? values["UserPrincipalName"][0] : '';
-    const mirrorTyped = values["TemplateOnPremId"] ? values["TemplateOnPremId"][0] : '';
-    const location = ''; 
-    const supervisor = ''; 
+    // Extract fields using normalized key lookup
+    const employeeName = getValue(values, "Employee Name");
+    const jobTitle = getValue(values, "Employee Job Title");
+    const upnField = getValue(values, "Employee's LEAD Email Address:");
+    const supervisor = getValue(values, "Employee's Supervisor:");
+    const mirrorTyped = getValue(values, "List user to mirror access");
+    const location = getValue(values, "Employee Location:");
 
     // Lookup template info
     const template = getTemplateInfo(jobTitle, mirrorTyped);
@@ -171,7 +168,7 @@ function onFormSubmit() {
     Logger.log(`POST ${cfg.apiUrl} -> ${response.getResponseCode()}`);
     Logger.log(response.getContentText());
 
-    // Optional: append metadata back to NewHires
+    // Append metadata back to NewHires
     appendToNewHiresSheet(payload.userPrincipalName, jobTitle, payload.templateUserId, payload.templateCloudUPN);
 
     return { status: response.getResponseCode(), body: response.getContentText() };
