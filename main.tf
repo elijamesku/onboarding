@@ -114,6 +114,7 @@ resource "aws_lambda_function" "onboarding" {
   s3_bucket = var.lambda_artifact_bucket
   s3_key    = var.lambda_s3_key
 
+
   environment {
     variables = {
       API_KEY       = var.lambda_api_key
@@ -183,4 +184,22 @@ resource "aws_iam_role_policy" "op_sqs_policy" {
       Resource = aws_sqs_queue.newhire_queue.arn
     }]
   })
+}
+
+################################
+##  EC2 Instance for Poller   ##
+################################
+resource "aws_instance" "poller" {
+  ami           = var.ami_id       # Replace with your desired AMI ID
+  instance_type = "t3.medium"
+  subnet_id     = var.subnet_id    # Replace with your subnet
+  key_name      = var.key_name     # Optional, if you want SSH access
+
+  # Attach the IAM instance profile
+  iam_instance_profile = aws_iam_instance_profile.op_sqs_profile.name
+
+  tags = {
+    Name = "OnboardingPoller"
+    Environment = "prod"
+  }
 }
