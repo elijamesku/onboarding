@@ -22,6 +22,3 @@ variable "lambda_s3_key" {
   default = "onboarding/jscode/lambda.zip"
 }
 
-variable "ami_id" {
-  default = "ami-0e16d075ec2375cf5"
-}
