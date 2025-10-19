@@ -1,16 +1,9 @@
 <# 
- AD Onboarding Poller (PS 5.1 compatible)
+ AD Onboarding Poller
  - Receives onboarding payloads from SQS
  - Creates on-prem AD users (clone selected attributes from a template + payload overrides)
  - Adds to on-prem groups
- - Appends a CSV for post-sync cloud processing
  - Deletes SQS message on success
-
- Prereqs:
- - Domain-joined Windows server
- - RSAT ActiveDirectory module installed
- - AWS.Tools.SQS (+ AWS.Tools.Common) installed
- - Instance profile with: sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility
 #>
 
 #region Configuration ----------------------------------------------------------
@@ -22,15 +15,15 @@ $NewUsersFile  = Join-Path $BasePath "PostSync\NewHires.csv"
 $LogFile       = Join-Path $BasePath "Logs\Poller.log"
 
 # AD defaults
-$OUPath        = $OUPath = "CN=Users,DC=lab,DC=local"
+$OUPath        = "CN=Users,DC=lab,DC=local"
 $PasswordLength = 16
 $EnableAccount  = $true
 $ChangePasswordAtNextLogon = $true
 
 # Poll behavior
-$MaxPerReceive   = 5       # up to 10
-$WaitTimeSeconds = 20      # long poll
-$VisibilitySec   = 300     # hold while processing
+$MaxPerReceive   = 5
+$WaitTimeSeconds = 20
+$VisibilitySec   = 300
 $SleepBetweenDrainsSec = 2
 
 # Retry tuning
@@ -42,7 +35,7 @@ function Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     $line = "$ts [$Level] $Message"
-    try { 
+    try {
         $dir = Split-Path $LogFile
         if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
         Add-Content -Path $LogFile -Value $line -ErrorAction Stop
@@ -50,13 +43,13 @@ function Log {
     Write-Output $line
 }
 
-# Ensure folders for CSV
+# Ensure CSV folder
 try {
     $csvDir = Split-Path $NewUsersFile
     if (-not (Test-Path $csvDir)) { New-Item -ItemType Directory -Force -Path $csvDir | Out-Null }
 } catch {}
 
-# Import modules
+# Modules
 try { Import-Module ActiveDirectory -ErrorAction Stop; Log "Imported ActiveDirectory module." } catch { Log ("ActiveDirectory module not available: " + ($_ | Out-String)) "ERROR"; throw }
 try { Import-Module AWS.Tools.SQS    -ErrorAction Stop; Log "Imported AWS.Tools.SQS module."    } catch { Log ("AWS.Tools.SQS module not available: "    + ($_ | Out-String)) "ERROR"; throw }
 
@@ -89,9 +82,9 @@ function Get-TemplateUser {
             $u = Get-ADUser -Identity $Identifier -Properties * -ErrorAction SilentlyContinue
             if ($u) { return $u }
         }
-        $u = Get-ADUser -Filter "SamAccountName -eq '$Identifier'"      -Properties * -ErrorAction SilentlyContinue
+        $u = Get-ADUser -Filter "SamAccountName -eq '$Identifier'"    -Properties * -ErrorAction SilentlyContinue
         if ($u) { return $u }
-        $u = Get-ADUser -Filter "UserPrincipalName -eq '$Identifier'"   -Properties * -ErrorAction SilentlyContinue
+        $u = Get-ADUser -Filter "UserPrincipalName -eq '$Identifier'" -Properties * -ErrorAction SilentlyContinue
         if ($u) { return $u }
         $u = Get-ADUser -Identity $Identifier -Properties * -ErrorAction SilentlyContinue
         return $u
@@ -104,7 +97,7 @@ function Get-TemplateUser {
 function Process-Message {
     param([hashtable]$Payload)
 
-    # Basic field extraction (safe)
+    # Extract payload fields
     $templateId  = $null
     $memberOf    = $null
     $upn         = $null
@@ -112,6 +105,7 @@ function Process-Message {
     $sn          = $null
     $displayName = $null
     $jobTitle    = $null
+    $office      = $null
 
     if ($Payload.ContainsKey('templateUserId'))     { $templateId  = $Payload.templateUserId }
     if ($Payload.ContainsKey('memberOf'))           { $memberOf    = $Payload.memberOf }
@@ -120,61 +114,43 @@ function Process-Message {
     if ($Payload.ContainsKey('sn'))                 { $sn          = $Payload.sn }
     if ($Payload.ContainsKey('displayName'))        { $displayName = $Payload.displayName }
     if ($Payload.ContainsKey('title'))              { $jobTitle    = $Payload.title }
+    if ($Payload.ContainsKey('physicalDeliveryOfficeName')) { $office = $Payload.physicalDeliveryOfficeName }
 
-    if (-not $templateId) { 
-        Log "Payload missing templateUserId; skipping." "WARN"
-        return $false
-    }
-    if (-not $upn) {
-        Log "Payload missing userPrincipalName; skipping." "ERROR"
-        return $false
-    }
+    if (-not $templateId) { Log "Payload missing templateUserId; skipping." "WARN"; return $false }
+    if (-not $upn)        { Log "Payload missing userPrincipalName; skipping." "ERROR"; return $false }
 
-    # Idempotency – user exists?
+    # Idempotency
     $exists = $null
-    try { $exists = Get-ADUser -Filter "UserPrincipalName -eq '$upn'" -ErrorAction SilentlyContinue } catch {}
+    try { $exists = Get-ADUser -Filter "UserPrincipalName -eq '$upn'" -Properties * -ErrorAction SilentlyContinue } catch {}
     if ($exists) {
         Log ("User already exists: " + $upn + " (sAM: " + $exists.SamAccountName + ")")
-        $jt = "UNKNOWN"
-        if ($jobTitle) { $jt = $jobTitle }
+        $jt = if ($jobTitle) { $jobTitle } else { "UNKNOWN" }
         try { Append-NewHireCsv -Upn $upn -JobTitle $jt } catch {}
         return $true
     }
 
-    # Resolve template user
+    # Template user
     $templateUser = Get-TemplateUser -Identifier $templateId
-    if (-not $templateUser) {
-        Log ("Template user not found: " + $templateId) "ERROR"
-        return $false
-    }
+    if (-not $templateUser) { Log ("Template user not found: " + $templateId) "ERROR"; return $false }
 
-    # Clone a small, safe set of attributes (LDAP names for -Replace)
-    $cloneAttrs = @('department','company','streetAddress','l','st','postalCode','co','employeeID','manager','physicalDeliveryOfficeName','telephoneNumber')
-    $extra = @{}
-    foreach ($a in $cloneAttrs) {
-        try {
-            $val = $templateUser.$a
-            if ($val) { $extra[$a] = $val }
-        } catch {}
+    # Build names
+    if (-not $givenName -and $displayName) {
+        $givenName = ($displayName -split '\s+')[0]
     }
-
-    # Apply overrides to be used for initial creation
-    $gName = ""; if ($givenName)   { $gName = [string]$givenName }
-    $sName = ""; if ($sn)          { $sName = [string]$sn }
-    $disp  = ""; if ($displayName) { $disp  = [string]$displayName }
-    if (-not $disp) {
-        $disp = ($gName + " " + $sName).Trim()
-        if (-not $disp) { $disp = $upn }
+    if (-not $sn -and $displayName) {
+        $sn = ($displayName -split '\s+')[-1]
     }
+    $gName = if ($givenName) { [string]$givenName } else { "" }
+    $sName = if ($sn)       { [string]$sn }       else { "" }
+    $disp  = if ($displayName -and ($displayName -ne "")) { [string]$displayName } else { ($gName + " " + $sName).Trim() }
+    if (-not $disp) { $disp = $upn }
 
-    # sAMAccountName from UPN (left side)
+    # sAM from UPN
     $sam = ($upn -split '@')[0]
     Log ("Initial sAMAccountName candidate: " + $sam)
-    $orig = $sam
-    $i = 1
+    $orig = $sam; $i = 1
     while (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue) {
-        $sam = $orig + $i
-        $i++
+        $sam = $orig + $i; $i++
         if ($i -gt 100) { Log ("Too many duplicates for base sAM '" + $orig + "'") "ERROR"; return $false }
     }
     if ($sam -ne $orig) { Log ("Adjusted sAMAccountName to: " + $sam) }
@@ -187,11 +163,11 @@ function Process-Message {
         if ($idx -ge 0) { $targetOU = $dn.Substring($idx) }
     } catch {}
 
-    # Prepare New-ADUser params (only supported switches)
+    # Create user (PassThru so we can keep the object)
     $newUserParams = @{
         Name                 = $disp
         SamAccountName       = $sam
-        UserPrincipalName    = $upn                 # we have it; no fallback domain here
+        UserPrincipalName    = $upn
         GivenName            = $gName
         Surname              = $sName
         DisplayName          = $disp
@@ -199,9 +175,10 @@ function Process-Message {
         Path                 = $targetOU
         AccountPassword      = (ConvertTo-SecureString (New-RandomPassword -Length $PasswordLength) -AsPlainText -Force)
         PasswordNeverExpires = $false
+        PassThru             = $true
     }
 
-    # Create with retries
+    $adUser = $null
     $created = $false
     for ($attempt = 1; $attempt -le $MaxCreateRetries; $attempt++) {
         try {
@@ -214,26 +191,75 @@ function Process-Message {
                     try { Set-ADUser -Identity $adUser -ChangePasswordAtLogon $true -ErrorAction SilentlyContinue } catch {}
                 }
             }
-
-            # Push cloned attributes after creation (LDAP names via -Replace)
-            if ($extra.Keys.Count -gt 0) {
-                try { Set-ADUser -Identity $adUser -Replace $extra -ErrorAction SilentlyContinue } catch {}
-            }
-
             $created = $true
-            Log ("Created AD user: " + $upn)
             break
         } catch {
             Log ("Error creating AD user attempt " + $attempt + ": " + ($_ | Out-String)) "ERROR"
             Start-Sleep -Seconds 5
         }
     }
-    if (-not $created) {
-        Log "Failed to create user after retries."
-        return $false
+    if (-not $created) { Log "Failed to create user after retries."; return $false }
+
+    # --------- Copy attributes from template (post-creation) ----------
+    # General tab
+    $description = if ($jobTitle) { $jobTitle } else { $null }  #Description = Job Title
+    $officeName  = if ($office) { $office } else { $templateUser.physicalDeliveryOfficeName }
+
+    # Organization tab values (prefer template, but keep payload job title)
+    $titleVal      = if ($jobTitle) { $jobTitle } else { $templateUser.title }
+    $deptVal       = $templateUser.department
+    $companyVal    = $templateUser.company
+    $managerDn     = $templateUser.Manager  # DN if set
+
+    # Address tab
+    $street   = $templateUser.streetAddress
+    $city     = $templateUser.l
+    $state    = $templateUser.st
+    $zip      = $templateUser.postalCode
+    $country  = $templateUser.co
+
+    # Telephones/Web
+    $phone    = $templateUser.telephoneNumber
+    $www      = $templateUser.wWWHomePage
+
+   
+    try {
+        # Named params (title/department/company/manager)
+        $named = @{
+            Identity = $adUser
+        }
+        if ($titleVal)   { $named['Title']      = $titleVal }
+        if ($deptVal)    { $named['Department'] = $deptVal }
+        if ($companyVal) { $named['Company']    = $companyVal }
+        if ($managerDn)  { $named['Manager']    = $managerDn }
+
+        if ($named.Keys.Count -gt 1) { Set-ADUser @named -ErrorAction SilentlyContinue }
+
+        # LDAP replace block (General, Address, contact, mail/web)
+        $replace = @{}
+        if ($description)  { $replace['description']                = $description }
+        if ($officeName)   { $replace['physicalDeliveryOfficeName'] = $officeName }
+        if ($phone)        { $replace['telephoneNumber']            = $phone }
+        if ($street)       { $replace['streetAddress']              = $street }
+        if ($city)         { $replace['l']                          = $city }
+        if ($state)        { $replace['st']                         = $state }
+        if ($zip)          { $replace['postalCode']                 = $zip }
+        if ($country)      { $replace['co']                         = $country }
+        if ($www)          { $replace['wWWHomePage']                = $www }
+
+        # Always set mail to UPN 
+        $replace['mail'] = $upn
+
+        if ($replace.Keys.Count -gt 0) {
+            Set-ADUser -Identity $adUser -Replace $replace -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Log ("Post-create Set-ADUser failed: " + ($_ | Out-String)) "WARN"
     }
 
-    # Add to on-prem groups
+    Log ("Created AD user: " + $upn)
+
+    # --------- Groups ----------
     $groupsToAdd = @()
     if ($memberOf) {
         if ($memberOf -is [System.Array]) { $groupsToAdd = $memberOf }
@@ -268,14 +294,8 @@ function Process-Message {
         if (-not $added) { Log ("Failed to add " + $upn + " to group '" + $g + "' after retries.") "ERROR" }
     }
 
-    # Append CSV for post-sync
-    try {
-        $jtCsv = "UNKNOWN"
-        if ($jobTitle) { $jtCsv = $jobTitle }
-        Append-NewHireCsv -Upn $upn -JobTitle $jtCsv
-    } catch {
-        Log ("Failed to append CSV: " + ($_ | Out-String)) "ERROR"
-    }
+    # CSV
+    try { Append-NewHireCsv -Upn $upn -JobTitle (if ($jobTitle) { $jobTitle } else { "UNKNOWN" }) } catch {}
 
     return $true
 }
@@ -301,7 +321,7 @@ try {
     }
 
     while ($true) {
-        # AWS.Tools.SQS returns an ARRAY of Message objects (no .Messages property)
+        # AWS.Tools.SQS returns an array of Message objects
         $msgs = Receive-SQSMessage @receiveParams -Region $AwsRegion
 
         if (-not $msgs) {
@@ -313,7 +333,6 @@ try {
             try {
                 Log ("Received SQS message Id: " + $m.MessageId + " Size: " + $m.Body.Length)
                 $payloadObj = $m.Body | ConvertFrom-Json
-                # Convert PSCustomObject to hashtable for our function
                 $payload = @{}
                 $payloadObj.PSObject.Properties | ForEach-Object { $payload[$_.Name] = $_.Value }
 
@@ -326,7 +345,7 @@ try {
                 }
             } catch {
                 Log ("Error processing message " + $m.MessageId + ": " + ($_ | Out-String)) "ERROR"
-                # leave it; visibility will expire for retry
+                
             }
         }
 
