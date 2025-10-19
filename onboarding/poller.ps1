@@ -1,332 +1,339 @@
-<#
-polling SQS for onboarding messages -- create on-prem AD users by cloning a template and then add to on-prem groups,
-and append new hires to NewHires.csv for post-sync cloud group processing
+<# 
+ AD Onboarding Poller (PS 5.1 compatible)
+ - Receives onboarding payloads from SQS
+ - Creates on-prem AD users (clone selected attributes from a template + payload overrides)
+ - Adds to on-prem groups
+ - Appends a CSV for post-sync cloud processing
+ - Deletes SQS message on success
 
-assumptions to be made prior to script run(if not do not run) -- 
- - EC2 is domain joined and runs with an account that can create AD users and modify groups
- - AWS.Tools.SQS module is installed and instance profile / credentials are present
- - ActiveDirectory PowerShell module is available (RSAT)
+ Prereqs:
+ - Domain-joined Windows server
+ - RSAT ActiveDirectory module installed
+ - AWS.Tools.SQS (+ AWS.Tools.Common) installed
+ - Instance profile with: sqs:ReceiveMessage, sqs:DeleteMessage, sqs:GetQueueAttributes, sqs:ChangeMessageVisibility
 #>
 
-#region Configuration
-# SQS -- set queue url 
-$SqsQueueUrl = "https://sqs.us-east-1.........." 
+#region Configuration ----------------------------------------------------------
+$SqsQueueUrl   = "https://sqs.us-east-1.amazonaws.com/699041963732/newhire-queue"
+$AwsRegion     = "us-east-1"
 
-# Paths
-$BasePath       = "C:\Onboarding"
-$NewUsersFile   = Join-Path $BasePath "PostSync\NewHires.csv"  
-$LogFile        = Join-Path $BasePath "Logs\Poller.log"
+$BasePath      = "C:\Onboarding"
+$NewUsersFile  = Join-Path $BasePath "PostSync\NewHires.csv"
+$LogFile       = Join-Path $BasePath "Logs\Poller.log"
 
 # AD defaults
-
-# OU where new users will be created if not copying DN -- customize(change once i check ad)
-$OUPath         = "OU=Users,DC=company,DC=com"   
+$OUPath        = $OUPath = "CN=Users,DC=lab,DC=local"
 $PasswordLength = 16
 $EnableAccount  = $true
 $ChangePasswordAtNextLogon = $true
 
-# poll behavior
-$MaxMessagesPerPoll = 5
-$WaitTimeSeconds    = 10   
+# Poll behavior
+$MaxPerReceive   = 5       # up to 10
+$WaitTimeSeconds = 20      # long poll
+$VisibilitySec   = 300     # hold while processing
+$SleepBetweenDrainsSec = 2
 
-# seconds to process message before it becomes visible again
-$VisibilityTimeout  = 300 
-
-# retry tuning
-$MaxCreateRetries = 2
+# Retry tuning
+$MaxCreateRetries   = 2
+$MaxAddGroupRetries = 2
+#endregion --------------------------------------------------------------------
 
 function Log {
-    param([string]$Message, [string]$Level="INFO")
+    param([string]$Message, [string]$Level = "INFO")
     $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     $line = "$ts [$Level] $Message"
-    Add-Content -Path $LogFile -Value $line
+    try { 
+        $dir = Split-Path $LogFile
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        Add-Content -Path $LogFile -Value $line -ErrorAction Stop
+    } catch {}
     Write-Output $line
 }
 
-# ensure folders exist
-if (-not (Test-Path (Split-Path $LogFile))) { New-Item -ItemType Directory -Path (Split-Path $LogFile) -Force | Out-Null }
-if (-not (Test-Path (Split-Path $NewUsersFile))) { New-Item -ItemType Directory -Path (Split-Path $NewUsersFile) -Force | Out-Null }
-
-# import modules
+# Ensure folders for CSV
 try {
-    Import-Module ActiveDirectory -ErrorAction Stop
-} catch {
-    Log "ERROR: ActiveDirectory module not available: $_" "ERROR"
-    throw
-}
-try {
-    Import-Module AWS.Tools.SQS -ErrorAction Stop
-} catch {
-    Log "ERROR: AWS.Tools.SQS module not available. Install-Module -Name AWS.Tools.SQS" "ERROR"
-    throw
-}
+    $csvDir = Split-Path $NewUsersFile
+    if (-not (Test-Path $csvDir)) { New-Item -ItemType Directory -Force -Path $csvDir | Out-Null }
+} catch {}
 
-# password generation (may remove due to company requirements but may leave so we can reset anywho)
+# Import modules
+try { Import-Module ActiveDirectory -ErrorAction Stop; Log "Imported ActiveDirectory module." } catch { Log ("ActiveDirectory module not available: " + ($_ | Out-String)) "ERROR"; throw }
+try { Import-Module AWS.Tools.SQS    -ErrorAction Stop; Log "Imported AWS.Tools.SQS module."    } catch { Log ("AWS.Tools.SQS module not available: "    + ($_ | Out-String)) "ERROR"; throw }
+
 function New-RandomPassword {
     param([int]$Length = 16)
-    
-    # generating a complex password with upper/lower/digits/special
-    $upper = 48..57 + 65..90 + 97..122 | Get-Random -Count 0  # placeholder
     Add-Type -AssemblyName System.Web
-    $pw = [System.Web.Security.Membership]::GeneratePassword($Length, 4)
-    return $pw
+    [System.Web.Security.Membership]::GeneratePassword($Length, 4)
 }
 
-# helper that safely appends the new hire to CSV (creates file if missing)
 function Append-NewHireCsv {
-    param($Upn, $JobTitle)
+    param([string]$Upn, [string]$JobTitle)
     $record = [PSCustomObject]@{
         UserPrincipalName = $Upn
-        JobTitle = $JobTitle
+        JobTitle          = $JobTitle
+        Timestamp         = (Get-Date).ToString("s")
     }
     if (-not (Test-Path $NewUsersFile)) {
         $record | Export-Csv -Path $NewUsersFile -NoTypeInformation
     } else {
         $record | Export-Csv -Path $NewUsersFile -NoTypeInformation -Append
     }
-    Log "Appended $Upn,$JobTitle to NewHires.csv"
+    Log ("Appended CSV -> " + $Upn + "," + $JobTitle)
 }
 
-# main polling loop — one run (call from scheduled task or wrap in while loop for continuous)
-try {
-    Log "Starting poll of SQS: $SqsQueueUrl"
-    $receiveParams = @{
-        QueueUrl         = $SqsQueueUrl
-        MaxNumberOfMessage = $MaxMessagesPerPoll
-        WaitTimeSeconds  = $WaitTimeSeconds
-        VisibilityTimeout = $VisibilityTimeout
+function Get-TemplateUser {
+    param([string]$Identifier)
+    if (-not $Identifier) { return $null }
+    try {
+        if ($Identifier -match '^[0-9a-fA-F\-]{36}$') {
+            $u = Get-ADUser -Identity $Identifier -Properties * -ErrorAction SilentlyContinue
+            if ($u) { return $u }
+        }
+        $u = Get-ADUser -Filter "SamAccountName -eq '$Identifier'"      -Properties * -ErrorAction SilentlyContinue
+        if ($u) { return $u }
+        $u = Get-ADUser -Filter "UserPrincipalName -eq '$Identifier'"   -Properties * -ErrorAction SilentlyContinue
+        if ($u) { return $u }
+        $u = Get-ADUser -Identity $Identifier -Properties * -ErrorAction SilentlyContinue
+        return $u
+    } catch {
+        Log ("Get-TemplateUser error for '" + $Identifier + "': " + ($_ | Out-String)) "ERROR"
+        return $null
+    }
+}
+
+function Process-Message {
+    param([hashtable]$Payload)
+
+    # Basic field extraction (safe)
+    $templateId  = $null
+    $memberOf    = $null
+    $upn         = $null
+    $givenName   = $null
+    $sn          = $null
+    $displayName = $null
+    $jobTitle    = $null
+
+    if ($Payload.ContainsKey('templateUserId'))     { $templateId  = $Payload.templateUserId }
+    if ($Payload.ContainsKey('memberOf'))           { $memberOf    = $Payload.memberOf }
+    if ($Payload.ContainsKey('userPrincipalName'))  { $upn         = $Payload.userPrincipalName }
+    if ($Payload.ContainsKey('givenName'))          { $givenName   = $Payload.givenName }
+    if ($Payload.ContainsKey('sn'))                 { $sn          = $Payload.sn }
+    if ($Payload.ContainsKey('displayName'))        { $displayName = $Payload.displayName }
+    if ($Payload.ContainsKey('title'))              { $jobTitle    = $Payload.title }
+
+    if (-not $templateId) { 
+        Log "Payload missing templateUserId; skipping." "WARN"
+        return $false
+    }
+    if (-not $upn) {
+        Log "Payload missing userPrincipalName; skipping." "ERROR"
+        return $false
     }
 
-    $resp = Receive-SQSMessage @receiveParams
-    if (-not $resp.Messages) {
-        Log "No messages received."
+    # Idempotency – user exists?
+    $exists = $null
+    try { $exists = Get-ADUser -Filter "UserPrincipalName -eq '$upn'" -ErrorAction SilentlyContinue } catch {}
+    if ($exists) {
+        Log ("User already exists: " + $upn + " (sAM: " + $exists.SamAccountName + ")")
+        $jt = "UNKNOWN"
+        if ($jobTitle) { $jt = $jobTitle }
+        try { Append-NewHireCsv -Upn $upn -JobTitle $jt } catch {}
+        return $true
+    }
+
+    # Resolve template user
+    $templateUser = Get-TemplateUser -Identifier $templateId
+    if (-not $templateUser) {
+        Log ("Template user not found: " + $templateId) "ERROR"
+        return $false
+    }
+
+    # Clone a small, safe set of attributes (LDAP names for -Replace)
+    $cloneAttrs = @('department','company','streetAddress','l','st','postalCode','co','employeeID','manager','physicalDeliveryOfficeName','telephoneNumber')
+    $extra = @{}
+    foreach ($a in $cloneAttrs) {
+        try {
+            $val = $templateUser.$a
+            if ($val) { $extra[$a] = $val }
+        } catch {}
+    }
+
+    # Apply overrides to be used for initial creation
+    $gName = ""; if ($givenName)   { $gName = [string]$givenName }
+    $sName = ""; if ($sn)          { $sName = [string]$sn }
+    $disp  = ""; if ($displayName) { $disp  = [string]$displayName }
+    if (-not $disp) {
+        $disp = ($gName + " " + $sName).Trim()
+        if (-not $disp) { $disp = $upn }
+    }
+
+    # sAMAccountName from UPN (left side)
+    $sam = ($upn -split '@')[0]
+    Log ("Initial sAMAccountName candidate: " + $sam)
+    $orig = $sam
+    $i = 1
+    while (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue) {
+        $sam = $orig + $i
+        $i++
+        if ($i -gt 100) { Log ("Too many duplicates for base sAM '" + $orig + "'") "ERROR"; return $false }
+    }
+    if ($sam -ne $orig) { Log ("Adjusted sAMAccountName to: " + $sam) }
+
+    # Target OU (from template DN if possible)
+    $targetOU = $OUPath
+    try {
+        $dn = $templateUser.DistinguishedName
+        $idx = $dn.IndexOf("OU=")
+        if ($idx -ge 0) { $targetOU = $dn.Substring($idx) }
+    } catch {}
+
+    # Prepare New-ADUser params (only supported switches)
+    $newUserParams = @{
+        Name                 = $disp
+        SamAccountName       = $sam
+        UserPrincipalName    = $upn                 # we have it; no fallback domain here
+        GivenName            = $gName
+        Surname              = $sName
+        DisplayName          = $disp
+        Enabled              = $false
+        Path                 = $targetOU
+        AccountPassword      = (ConvertTo-SecureString (New-RandomPassword -Length $PasswordLength) -AsPlainText -Force)
+        PasswordNeverExpires = $false
+    }
+
+    # Create with retries
+    $created = $false
+    for ($attempt = 1; $attempt -le $MaxCreateRetries; $attempt++) {
+        try {
+            Log ("Creating AD user: " + $disp + " (sAM: " + $sam + ") attempt " + $attempt)
+            $adUser = New-ADUser @newUserParams -ErrorAction Stop
+
+            if ($EnableAccount) {
+                Enable-ADAccount -Identity $adUser -ErrorAction Stop
+                if ($ChangePasswordAtNextLogon) {
+                    try { Set-ADUser -Identity $adUser -ChangePasswordAtLogon $true -ErrorAction SilentlyContinue } catch {}
+                }
+            }
+
+            # Push cloned attributes after creation (LDAP names via -Replace)
+            if ($extra.Keys.Count -gt 0) {
+                try { Set-ADUser -Identity $adUser -Replace $extra -ErrorAction SilentlyContinue } catch {}
+            }
+
+            $created = $true
+            Log ("Created AD user: " + $upn)
+            break
+        } catch {
+            Log ("Error creating AD user attempt " + $attempt + ": " + ($_ | Out-String)) "ERROR"
+            Start-Sleep -Seconds 5
+        }
+    }
+    if (-not $created) {
+        Log "Failed to create user after retries."
+        return $false
+    }
+
+    # Add to on-prem groups
+    $groupsToAdd = @()
+    if ($memberOf) {
+        if ($memberOf -is [System.Array]) { $groupsToAdd = $memberOf }
+        else {
+            $groupsToAdd = ($memberOf -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+        }
     } else {
-        foreach ($msg in $resp.Messages) {
-            $receipt = $msg.ReceiptHandle
-            $body = $msg.Body
-            Log "Received SQS message Id: $($msg.MessageId)"
+        try {
+            $groupsToAdd = Get-ADPrincipalGroupMembership -Identity $templateUser -ErrorAction Stop |
+                           Select-Object -ExpandProperty Name
+        } catch {
+            Log ("Could not read template groups: " + ($_ | Out-String)) "WARN"
+        }
+    }
 
-            # parse the JSON body
+    foreach ($g in $groupsToAdd) {
+        if (-not $g) { continue }
+        $added = $false
+        for ($ga = 1; $ga -le $MaxAddGroupRetries; $ga++) {
             try {
-                $payload = $body | ConvertFrom-Json
+                $adGroup = Get-ADGroup -Filter "Name -eq '$g'" -ErrorAction SilentlyContinue
+                if (-not $adGroup) { Log ("Group '" + $g + "' not found; skipping.") "WARN"; break }
+                Add-ADGroupMember -Identity $adGroup -Members $adUser -ErrorAction Stop
+                Log ("Added " + $upn + " to on-prem group '" + $g + "'")
+                $added = $true
+                break
             } catch {
-                Log "ERROR parsing message body JSON: $_" "ERROR"
-                
-                # delete bad message to avoid poison queue or move to DLQ in prod
-                try { Remove-SQSMessage -QueueUrl $SqsQueueUrl -ReceiptHandle $receipt } catch { Log "Failed delete bad message: $_" "ERROR" }
-                continue
+                Log ("Attempt " + $ga + ": Failed to add " + $upn + " to group '" + $g + "': " + ($_ | Out-String)) "WARN"
+                Start-Sleep -Seconds 3
             }
+        }
+        if (-not $added) { Log ("Failed to add " + $upn + " to group '" + $g + "' after retries.") "ERROR" }
+    }
 
-            # basic required fields
-            $reqId = $payload.requestId
-            $templateOnPremId = $payload.templateUserId
-            $memberOf = $payload.memberOf
-            $upn = $payload.userPrincipalName
-            $givenName = $payload.givenName
-            $sn = $payload.sn
-            $displayName = $payload.displayName
+    # Append CSV for post-sync
+    try {
+        $jtCsv = "UNKNOWN"
+        if ($jobTitle) { $jtCsv = $jobTitle }
+        Append-NewHireCsv -Upn $upn -JobTitle $jtCsv
+    } catch {
+        Log ("Failed to append CSV: " + ($_ | Out-String)) "ERROR"
+    }
 
-            if (-not $templateOnPremId) {
-                Log "Message $($msg.MessageId) missing templateUserId; moving on." "WARN"
-                
-                # delete or move to DLQ — for now it will delete to avoid repeat
-                Remove-SQSMessage -QueueUrl $SqsQueueUrl -ReceiptHandle $receipt
-                continue
-            }
-
-            # idempotency checks if a user already exists with this UPN or samAccountName
-            $existingUser = $null
-            if ($upn) {
-                try {
-                    $existingUser = Get-ADUser -Filter "UserPrincipalName -eq '$upn'" -ErrorAction SilentlyContinue
-                } catch {
-                    $existingUser = $null
-                }
-            }
-
-            if ($existingUser) {
-                Log "User with UPN $upn already exists (sAMAccountName: $($existingUser.sAMAccountName)). Deleting message."
-                
-                # appends to NewHires.csv if not present (safe guard)
-                Append-NewHireCsv -Upn $upn -JobTitle ($payload.positionTemplate -or $payload.title -or "UNKNOWN")
-                try { Remove-SQSMessage -QueueUrl $SqsQueueUrl -ReceiptHandle $receipt } catch { Log "Failed delete message for existing user: $_" "WARN" }
-                continue
-            }
-
-            # Fetch the template user from AD -- templateUserId expected to be DN or SAM or GUID(*** we can try multiple lookups here ***)
-            $templateUser = $null
-            try {
-                # try GUID (objectGUID) if looks like GUID
-                if ($templateOnPremId -match '^[0-9a-fA-F\-]{36}$') {
-                    $templateUser = Get-ADUser -Identity $templateOnPremId -Properties * -ErrorAction SilentlyContinue
-                }
-                if (-not $templateUser) {
-                    # try samAccountName
-                    $templateUser = Get-ADUser -Filter "SamAccountName -eq '$templateOnPremId'" -Properties * -ErrorAction SilentlyContinue
-                }
-                if (-not $templateUser) {
-                    # try userprincipalname
-                    $templateUser = Get-ADUser -Filter "UserPrincipalName -eq '$templateOnPremId'" -Properties * -ErrorAction SilentlyContinue
-                }
-                if (-not $templateUser) {
-                    # try distinguishedName
-                    $templateUser = Get-ADUser -Identity $templateOnPremId -Properties * -ErrorAction SilentlyContinue
-                }
-            } catch {
-                Log "Error fetching template user $templateOnPremId: $_" "ERROR"
-            }
-
-            if (-not $templateUser) {
-                Log "Template user $templateOnPremId not found. Skipping message $($msg.MessageId)." "ERROR"
-                
-                # optionally move to DLQ; delete here to avoid endless retries
-                try { Remove-SQSMessage -QueueUrl $SqsQueueUrl -ReceiptHandle $receipt } catch { Log "Failed deleting message for missing template: $_" "ERROR" }
-                continue
-            }
-
-            # build the object for new user by cloning the desired attributes from template and applying payload overrides
-            $newUserProps = @{}
-            # common attributes to clone - extend as needed
-            $attrsToClone = @('department','company','physicalDeliveryOfficeName','telephoneNumber','streetAddress','l','st','postalCode','co','employeeID','manager')
-            foreach ($a in $attrsToClone) {
-                if ($templateUser.$a) { $newUserProps[$a] = $templateUser.$a }
-            }
-
-            # apply overrides from payload if present
-            if ($givenName) { $newUserProps['GivenName'] = $givenName }
-            if ($sn) { $newUserProps['Surname'] = $sn }
-            if ($displayName) { $newUserProps['DisplayName'] = $displayName }
-            if ($payload.mailNickname) { $mailNick = $payload.mailNickname } else {
-                $mailNick = $payload.emailAlias -or ($givenName.Substring(0,1) + $sn) -replace '\s',''
-            }
-            if ($upn) { $newUserProps['UserPrincipalName'] = $upn }
-
-            # samAccountName generation (simple): take mailNickname truncated to 20 chars; ensure uniqueness
-            $sam = $mailNick
-            if ($sam.Length -gt 20) { $sam = $sam.Substring(0,20) }
-            # ensure not already used
-            $i = 0
-            while (Get-ADUser -Filter "SamAccountName -eq '$sam'" -ErrorAction SilentlyContinue) {
-                $i++; $sam = $mailNick + $i
-                if ($sam.Length -gt 20) { $sam = $sam.Substring(0,20) }
-            }
-
-            
-            # Determine the OU path based on the template user's location
-            try {
-                $templateUser = Get-ADUser -Identity $newUserProps['TemplateUser'] -Properties DistinguishedName -ErrorAction Stop
-                $dn = $templateUser.DistinguishedName
-                $ouStart = $dn.IndexOf("OU=")
-                if ($ouStart -ge 0) {
-                    $targetOUPath = $dn.Substring($ouStart)
-                    Log "Template user located in OU: $targetOUPath"
-                } else {
-                    Log "Template user DN did not contain OU= segment; falling back to default OU path" "WARN"
-                    $targetOUPath = $OUPath  # fallback
-                }
-            } catch {
-                Log "Failed to get OU for template user ($($newUserProps['TemplateUser'])): $_" "WARN"
-                $targetOUPath = $OUPath
-            }
-
-            # prep the New-ADUser parameters
-            $newUserParams = @{
-                Name = $newUserProps['DisplayName'] ?: ($givenName + " " + $sn)
-                SamAccountName = $sam
-                UserPrincipalName = $newUserProps['UserPrincipalName'] ?: ($sam + "@" + "company.com")
-                GivenName = $newUserProps['GivenName']
-                Surname = $newUserProps['Surname']
-                DisplayName = $newUserProps['DisplayName']
-                Enabled = $false  # enable after password set
-                Path = $targetOUPath   
-                AccountPassword = (ConvertTo-SecureString (New-RandomPassword -Length $PasswordLength) -AsPlainText -Force)
-                PasswordNeverExpires = $false
-            }
-
-
-            # add other optional attributes if present
-            foreach ($k in $newUserProps.Keys) {
-                if ($k -in @('GivenName','Surname','DisplayName','UserPrincipalName')) { continue }
-                $newUserParams[$k] = $newUserProps[$k]
-            }
-
-            # attempt create user with retries
-            $created = $false
-            for ($attempt = 1; $attempt -le $MaxCreateRetries; $attempt++) {
-                try {
-                    Log "Attempting to create AD user: $($newUserParams.Name) (sAM: $($newUserParams.SamAccountName)) (UPN: $($newUserParams.UserPrincipalName)) attempt $attempt"
-                    $adUser = New-ADUser @newUserParams -ErrorAction Stop
-                    # enable account if configured
-                    if ($EnableAccount) {
-                        Enable-ADAccount -Identity $adUser -ErrorAction Stop
-                        if ($ChangePasswordAtNextLogon) {
-                            Set-ADUser -Identity $adUser -ChangePasswordAtLogon $true
-                        }
-                    }
-                    $created = $true
-                    Log "Created AD user: $($newUserParams.UserPrincipalName)"
-                    break
-                } catch {
-                    Log "Error creating AD user attempt $attempt: $_" "ERROR"
-                    Start-Sleep -Seconds 5
-                }
-            }
-
-            if (-not $created) {
-                Log "Failed to create user after $MaxCreateRetries attempts. Skipping and leaving message in queue for retry." "ERROR"
-                continue  # do not delete the message so it can be retried
-            }
-
-            # add to on-prem groups from payload.memberOf (if present) or template groups
-            $groupsToAdd = @()
-            if ($memberOf) {
-                # payload.memberOf expected to be array or comma-separated string
-                if ($memberOf -is [System.Array]) { $groupsToAdd = $memberOf } else { $groupsToAdd = ($memberOf -split ',') | ForEach-Object { $_.Trim() } }
-            } else {
-                # optionally get group membership from template user in AD
-                try {
-                    $templateGroups = Get-ADPrincipalGroupMembership -Identity $templateUser | Select-Object -ExpandProperty Name
-                    $groupsToAdd = $templateGroups
-                } catch {
-                    Log "Warning: failed to enumerate groups from template user: $_" "WARN"
-                }
-            }
-
-            foreach ($g in $groupsToAdd) {
-                if (-not $g) { continue }
-                try {
-                    # resolve AD group object by name, then Add-ADGroupMember
-                    $adGroup = Get-ADGroup -Filter "Name -eq '$g'" -ErrorAction SilentlyContinue
-                    if (-not $adGroup) {
-                        Log "Group $g not found in AD. Skipping."
-                        continue
-                    }
-                    Add-ADGroupMember -Identity $adGroup -Members $adUser -ErrorAction Stop
-                    Log "Added $($newUserParams.UserPrincipalName) to on-prem group $g"
-                } catch {
-                    Log "Failed to add $($newUserParams.UserPrincipalName) to group $g: $_" "ERROR"
-                }
-            }
-
-            # append to NewHires.csv for post-sync processing (UPN, JobTitle)
-            try {
-                $jobTitle = $payload.positionTemplate -or $payload.title -or $payload.position -or "UNKNOWN"
-                Append-NewHireCsv -Upn $newUserParams.UserPrincipalName -JobTitle $jobTitle
-            } catch {
-                Log "Failed to append new hire to CSV: $_" "ERROR"
-                # don't delete SQS message; allow retry on next poll
-                continue
-            }
-
-            try {
-                Remove-SQSMessage -QueueUrl $SqsQueueUrl -ReceiptHandle $receipt
-                Log "Deleted SQS message Id: $($msg.MessageId) after successful processing."
-            } catch {
-                Log "Warning: Failed to delete message $($msg.MessageId): $_" "WARN"
-            }
-        } # end foreach msg
-    } # end else messages
-} catch {
-    Log "Unhandled error in poller main: $_" "ERROR"
+    return $true
 }
+
+# ------------------- MAIN RECEIVE/DRAIN LOOP (single run) --------------------
+try {
+    Log ("Starting poll of SQS: " + $SqsQueueUrl)
+
+    try {
+        $attrs = Get-SQSQueueAttribute -QueueUrl $SqsQueueUrl `
+            -AttributeName ApproximateNumberOfMessages,ApproximateNumberOfMessagesNotVisible `
+            -Region $AwsRegion
+        Log ("Queue approx visible: " + $attrs.ApproximateNumberOfMessages + "; in-flight: " + $attrs.ApproximateNumberOfMessagesNotVisible)
+    } catch {
+        Log ("Failed to read queue attributes: " + ($_ | Out-String)) "WARN"
+    }
+
+    $receiveParams = @{
+        QueueUrl            = $SqsQueueUrl
+        MaxNumberOfMessages = $MaxPerReceive
+        WaitTimeSeconds     = $WaitTimeSeconds
+        VisibilityTimeout   = $VisibilitySec
+    }
+
+    while ($true) {
+        # AWS.Tools.SQS returns an ARRAY of Message objects (no .Messages property)
+        $msgs = Receive-SQSMessage @receiveParams -Region $AwsRegion
+
+        if (-not $msgs) {
+            Log "No messages received."
+            break
+        }
+
+        foreach ($m in $msgs) {
+            try {
+                Log ("Received SQS message Id: " + $m.MessageId + " Size: " + $m.Body.Length)
+                $payloadObj = $m.Body | ConvertFrom-Json
+                # Convert PSCustomObject to hashtable for our function
+                $payload = @{}
+                $payloadObj.PSObject.Properties | ForEach-Object { $payload[$_.Name] = $_.Value }
+
+                $ok = Process-Message -Payload $payload
+                if ($ok) {
+                    Remove-SQSMessage -QueueUrl $SqsQueueUrl -ReceiptHandle $m.ReceiptHandle -Region $AwsRegion -ErrorAction Stop
+                    Log ("Deleted SQS message Id: " + $m.MessageId)
+                } else {
+                    Log ("Processing failed; leaving message " + $m.MessageId + " for retry.") "WARN"
+                }
+            } catch {
+                Log ("Error processing message " + $m.MessageId + ": " + ($_ | Out-String)) "ERROR"
+                # leave it; visibility will expire for retry
+            }
+        }
+
+        Start-Sleep -Seconds $SleepBetweenDrainsSec
+    }
+} catch {
+    Log ("Unhandled error in poller main: " + ($_ | Out-String)) "ERROR"
+}
+
 Log "Poller run complete."
