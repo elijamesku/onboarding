@@ -1,0 +1,3 @@
+test script on lb server but change ec2 config so ec2 can read sqs messages
+from the queue and populate
+
